@@ -1,145 +1,166 @@
-import pandas as pd
-import numpy as np
-import requests
-import zipfile
+from pathlib import Path
 import io
+import zipfile
 
-from datetime import datetime
-from sklearn import datasets, ensemble
+import pandas as pd
+import requests
+from sklearn.ensemble import RandomForestRegressor
 
-from evidently.dashboard import Dashboard
-from evidently.pipeline.column_mapping import ColumnMapping
-from evidently.dashboard.tabs import DataDriftTab, NumTargetDriftTab, RegressionPerformanceTab
+from evidently import Report, Dataset, DataDefinition, Regression
+from evidently.presets import DataDriftPreset, RegressionPreset
+from evidently.metrics import ValueDrift
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-"""## Bicycle Demand Data
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+STATIC_DIR.mkdir(exist_ok=True)
 
-This step automatically downloads the bike dataset from UCI.
-"""
+DATA_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00275/Bike-Sharing-Dataset.zip"
 
-content = requests.get("https://archive.ics.uci.edu/ml/machine-learning-databases/00275/Bike-Sharing-Dataset.zip").content
-with zipfile.ZipFile(io.BytesIO(content)) as arc:
-    raw_data = pd.read_csv(arc.open("hour.csv"), 
-                            header=0, 
-                            sep=',', 
-                            parse_dates=['dteday'], 
-                            index_col='dteday')
 
-# raw_data.head()
+def load_data() -> pd.DataFrame:
+    response = requests.get(DATA_URL, timeout=60)
+    response.raise_for_status()
 
-# Regression training
-target = 'cnt'
-prediction = 'prediction'
-numerical_features = ['temp', 'atemp', 'hum', 'windspeed', 'hr', 'weekday']
-categorical_features = ['season', 'holiday', 'workingday']
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        raw_data = pd.read_csv(
+            archive.open("hour.csv"),
+            header=0,
+            sep=",",
+            parse_dates=["dteday"],
+            index_col="dteday",
+        )
 
-reference = raw_data.loc['2011-01-01 00:00:00':'2011-01-28 23:00:00']
-current = raw_data.loc['2011-01-29 00:00:00':'2011-02-28 23:00:00']
+    return raw_data
 
-reference.head()
 
-regressor = ensemble.RandomForestRegressor(random_state = 0, 
-                                            n_estimators = 50)
+def build_datasets(raw_data: pd.DataFrame):
+    target = "cnt"
+    prediction = "prediction"
+    numerical_features = ["temp", "atemp", "hum", "windspeed", "hr", "weekday"]
+    categorical_features = ["season", "holiday", "workingday"]
 
-regressor.fit(reference[numerical_features + categorical_features], 
-            reference[target])
+    reference = raw_data.loc["2011-01-01 00:00:00":"2011-01-28 23:00:00"].copy()
+    current = raw_data.loc["2011-01-29 00:00:00":"2011-02-28 23:00:00"].copy()
 
-ref_prediction = regressor.predict(reference[numerical_features + categorical_features])
-current_prediction = regressor.predict(current[numerical_features + categorical_features])
+    regressor = RandomForestRegressor(
+        random_state=0,
+        n_estimators=50,
+    )
 
-reference['prediction'] = ref_prediction
-current['prediction'] = current_prediction
+    feature_columns = numerical_features + categorical_features
 
-# Model Perfomance
+    regressor.fit(reference[feature_columns], reference[target])
 
-column_mapping = ColumnMapping()
+    reference[prediction] = regressor.predict(reference[feature_columns])
+    current[prediction] = regressor.predict(current[feature_columns])
 
-column_mapping.target = target
-column_mapping.prediction = prediction
-column_mapping.numerical_features = numerical_features
-column_mapping.categorical_features = categorical_features
+    data_definition = DataDefinition(
+        numerical_columns=numerical_features,
+        categorical_columns=categorical_features,
+        regression=[Regression(target=target, prediction=prediction)],
+    )
 
-regression_perfomance_dashboard = Dashboard(tabs=[RegressionPerformanceTab()])
-regression_perfomance_dashboard.calculate(reference, None, column_mapping=column_mapping)
+    reference_dataset = Dataset.from_pandas(reference, data_definition=data_definition)
+    current_dataset = Dataset.from_pandas(current, data_definition=data_definition)
 
-# regression_perfomance_dashboard.show()
+    drift_definition = DataDefinition(
+        numerical_columns=numerical_features
+    )
+    reference_drift_dataset = Dataset.from_pandas(
+        reference[numerical_features], data_definition=drift_definition
+    )
+    current_drift_dataset = Dataset.from_pandas(
+        current[numerical_features], data_definition=drift_definition
+    )
 
-regression_perfomance_dashboard.save("./static/index.html")
+    return (
+        reference_dataset,
+        current_dataset,
+        reference_drift_dataset,
+        current_drift_dataset,
+    )
 
-#  Week 1
 
-regression_perfomance_dashboard.calculate(reference, current.loc['2011-01-29 00:00:00':'2011-02-07 23:00:00'], 
-                                            column_mapping=column_mapping)
+def save_regression_reports(reference_dataset: Dataset, current_dataset: Dataset):
+    report = Report([RegressionPreset()])
 
-# regression_perfomance_dashboard.show()
+    report.run(reference_dataset, None)
+    report.save_html(str(STATIC_DIR / "index.html"))
 
-regression_perfomance_dashboard.save("./static/regression_performance_after_week1.html")
+    week1 = Dataset.from_pandas(
+        current_dataset.as_dataframe().loc["2011-01-29 00:00:00":"2011-02-07 23:00:00"],
+        data_definition=current_dataset.data_definition,
+    )
+    report.run(week1, reference_dataset)
+    report.save_html(str(STATIC_DIR / "regression_performance_after_week1.html"))
 
-target_drift_dashboard = Dashboard(tabs=[NumTargetDriftTab()])
-target_drift_dashboard.calculate(reference, current.loc['2011-01-29 00:00:00':'2011-02-07 23:00:00'], 
-                                column_mapping=column_mapping)
+    week2 = Dataset.from_pandas(
+        current_dataset.as_dataframe().loc["2011-02-08 00:00:00":"2011-02-14 23:00:00"],
+        data_definition=current_dataset.data_definition,
+    )
+    report.run(week2, reference_dataset)
+    report.save_html(str(STATIC_DIR / "regression_performance_after_week2.html"))
 
-# target_drift_dashboard.show()
+    week3 = Dataset.from_pandas(
+        current_dataset.as_dataframe().loc["2011-02-15 00:00:00":"2011-02-21 23:00:00"],
+        data_definition=current_dataset.data_definition,
+    )
+    report.run(week3, reference_dataset)
+    report.save_html(str(STATIC_DIR / "regression_performance_after_week3.html"))
 
-target_drift_dashboard.save("./static/target_drift_after_week1.html")
 
-# Week 2
+def save_target_drift_reports(reference_dataset: Dataset, current_dataset: Dataset):
+    report = Report([ValueDrift(column="cnt")])
 
-regression_perfomance_dashboard.calculate(reference, current.loc['2011-02-07 00:00:00':'2011-02-14 23:00:00'], 
-                                            column_mapping=column_mapping)
+    week1 = Dataset.from_pandas(
+        current_dataset.as_dataframe().loc["2011-01-29 00:00:00":"2011-02-07 23:00:00"],
+        data_definition=current_dataset.data_definition,
+    )
+    report.run(week1, reference_dataset)
+    report.save_html(str(STATIC_DIR / "target_drift_after_week1.html"))
 
-# regression_perfomance_dashboard.show()
+    week2 = Dataset.from_pandas(
+        current_dataset.as_dataframe().loc["2011-02-08 00:00:00":"2011-02-14 23:00:00"],
+        data_definition=current_dataset.data_definition,
+    )
+    report.run(week2, reference_dataset)
+    report.save_html(str(STATIC_DIR / "target_drift_after_week2.html"))
 
-regression_perfomance_dashboard.save("./static/regression_performance_after_week2.html")
+    week3 = Dataset.from_pandas(
+        current_dataset.as_dataframe().loc["2011-02-15 00:00:00":"2011-02-21 23:00:00"],
+        data_definition=current_dataset.data_definition,
+    )
+    report.run(week3, reference_dataset)
+    report.save_html(str(STATIC_DIR / "target_drift_after_week3.html"))
 
-target_drift_dashboard.calculate(reference, current.loc['2011-02-07 00:00:00':'2011-02-14 23:00:00'], 
-                                column_mapping=column_mapping)
 
-# target_drift_dashboard.show()
+def save_data_drift_reports(reference_drift_dataset: Dataset, current_drift_dataset: Dataset):
+    report = Report([DataDriftPreset()])
 
-target_drift_dashboard.save("./static/target_drift_after_week2.html")
+    week1 = Dataset.from_pandas(
+        current_drift_dataset.as_dataframe().loc["2011-01-29 00:00:00":"2011-02-07 23:00:00"],
+        data_definition=current_drift_dataset.data_definition,
+    )
+    report.run(week1, reference_drift_dataset)
+    report.save_html(str(STATIC_DIR / "data_drift_dashboard_after_week1.html"))
 
-# Week 3
+    week2 = Dataset.from_pandas(
+        current_drift_dataset.as_dataframe().loc["2011-02-08 00:00:00":"2011-02-14 23:00:00"],
+        data_definition=current_drift_dataset.data_definition,
+    )
+    report.run(week2, reference_drift_dataset)
+    report.save_html(str(STATIC_DIR / "data_drift_dashboard_after_week2.html"))
 
-regression_perfomance_dashboard.calculate(reference, current.loc['2011-02-15 00:00:00':'2011-02-21 23:00:00'], 
-                                            column_mapping=column_mapping)
 
-# regression_perfomance_dashboard.show()
+raw_data = load_data()
+reference_dataset, current_dataset, reference_drift_dataset, current_drift_dataset = build_datasets(raw_data)
 
-regression_perfomance_dashboard.save("./static/regression_performance_after_week3.html")
-
-target_drift_dashboard.calculate(reference, current.loc['2011-02-15 00:00:00':'2011-02-21 23:00:00'], 
-                                column_mapping=column_mapping)
-
-# target_drift_dashboard.show()
-
-target_drift_dashboard.save("./static/target_drift_after_week3.html")
-
-# Data Drift
-
-column_mapping = ColumnMapping()
-
-column_mapping.numerical_features = numerical_features
-
-data_drift_dashboard = Dashboard(tabs=[DataDriftTab()])
-data_drift_dashboard.calculate(reference, current.loc['2011-01-29 00:00:00':'2011-02-07 23:00:00'], 
-                                column_mapping=column_mapping)
-
-# data_drift_dashboard.show()
-
-data_drift_dashboard.save("./static/data_drift_dashboard_after_week1.html")
-
-# Data Drift Week 2
-column_mapping = ColumnMapping()
-column_mapping.numerical_features = numerical_features
-data_drift_dashboard = Dashboard(tabs=[DataDriftTab()])
-data_drift_dashboard.calculate(reference, current.loc['2011-02-07 00:00:00':'2011-02-14 23:00:00'],
-                                column_mapping=column_mapping)
-data_drift_dashboard.save("./static/data_drift_dashboard_after_week2.html")
-
+save_regression_reports(reference_dataset, current_dataset)
+save_target_drift_reports(reference_dataset, current_dataset)
+save_data_drift_reports(reference_drift_dataset, current_drift_dataset)
 
 app = FastAPI()
-
-app.mount("/", StaticFiles(directory="static",html = True), name="static")
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
